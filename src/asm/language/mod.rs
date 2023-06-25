@@ -1,13 +1,15 @@
 use std::{
     fmt::{Display, Write},
-    ops::Range,
     write,
 };
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use lalrpop_util::lalrpop_mod;
 use parse_display::Display;
-use rgbds::{rpn::EvalError, section::Kind as SectionKind};
+use rgbds::{
+    rpn::EvalError,
+    section::{Kind as SectionKind, Modifier},
+};
 
 mod lexer;
 pub use lexer::{Lexer, Location, Tokenizer};
@@ -17,7 +19,7 @@ mod tokens;
 use tokens::Token;
 use warnings_gen::Warnings;
 
-use crate::{input::SourceString, instructions::BadInstructionKind};
+use crate::{fstack::DiagInfo, input::SourceString, instructions::BadInstructionKind};
 
 pub type ParseError<'fstack> =
     lalrpop_util::ParseError<Location<'fstack>, Token, AsmError<'fstack>>;
@@ -212,9 +214,7 @@ pub enum AsmErrorKind {
 
     // Semantic errors.
     #[display("{0} is already defined")]
-    SectAlreadyDefined(SourceString, Option<(usize, Range<usize>)>),
-    #[display("{0} is already defined")]
-    SymAlreadyDefined(SourceString, Option<(usize, Range<usize>)>),
+    SymAlreadyDefined(SourceString, DiagInfo),
     #[display("Only labels can be local")]
     IllegalLocal,
     #[display("Symbol \"{0}\" does not exist")]
@@ -230,6 +230,20 @@ pub enum AsmErrorKind {
     PurgingReferenced(SourceString),
     #[display("{0}")]
     EvalError(EvalError<SymEvalErrKind>),
+
+    // Section definition errors.
+    #[display("{0} is already defined")]
+    SectAlreadyDefined(SourceString, DiagInfo),
+    #[display("{0} has already been defined as {1} section")]
+    DifferentSectMod(SourceString, Modifier, DiagInfo),
+    #[display("{0} has already been defined as a {1} section")]
+    DifferentSectKind(SourceString, SectionKind, DiagInfo),
+    // TODO: many of these "conflict" errors do not report which of the other definitions they conflict with;
+    //       mainly because this would require tracking source info with much more granularity.
+    #[display("Conflicting banks specified for {0} (previously {1}, now {2})")]
+    DifferentBank(SourceString, u32, u32),
+    #[display("Cannot declare a {0} section as union")]
+    RomUnion(SectionKind),
 
     // Section specification errors.
     #[display("An address must be in 16-bit range, not ${0:04x}")]
@@ -334,10 +348,28 @@ impl AsmErrorKind {
                     );
                 }
             }
+            Self::DifferentSectMod(_, _, prev_def_info) => {
+                if let Some((file_id, range)) = prev_def_info {
+                    labels.push(
+                        Label::secondary(*file_id, range.clone())
+                            .with_message("Previously defined here"),
+                    );
+                }
+            }
+            Self::DifferentSectKind(_, _, prev_def_info) => {
+                if let Some((file_id, range)) = prev_def_info {
+                    labels.push(
+                        Label::secondary(*file_id, range.clone())
+                            .with_message("Previously defined here"),
+                    );
+                }
+            }
             Self::SymAlreadyDefined(_, prev_def_info) => {
                 if let Some((file_id, range)) = prev_def_info {
-                    labels.extend_from_slice(&[Label::secondary(*file_id, range.clone())
-                        .with_message("Previously defined here")]);
+                    labels.push(
+                        Label::secondary(*file_id, range.clone())
+                            .with_message("Previously defined here"),
+                    );
                 }
             }
 

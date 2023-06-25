@@ -9,7 +9,7 @@ use string_interner::{backend::StringBackend, symbol::SymbolU32, StringInterner}
 
 use crate::{
     expr::{ByteOrExpr, Expression},
-    fstack::Fstack,
+    fstack::{DiagInfo, Fstack},
     input::SourceString,
     language::{AsmError, AsmErrorKind, Location, Warning},
     macro_args::MacroArgs,
@@ -43,37 +43,79 @@ impl<'fstack> Sections<'fstack> {
         name_string: SourceString,
         kind: Kind,
         modifier: Modifier,
-        address: Option<Expression<'fstack>>,
-        attrs: SectionAttributes<'fstack>,
+        attrs: NormalizedSectAttrs,
         def_begin: Location<'fstack>,
         def_end: Location<'fstack>,
-        symbols: &Symbols,
-        macro_args: Option<&MacroArgs>,
     ) -> Result<(), AsmError<'fstack>> {
+        use std::collections::hash_map::Entry;
+
+        // TODO: bail if any UNION is active
+
         let name = self.names.get_or_intern(&name_string);
-        // `try_insert` would be nicer, but it's unstable for now.
-        if let Some(other) = self.sections.get(&name) {
-            // TODO: merging
+        let offset = match self.sections.entry(name) {
+            Entry::Occupied(mut entry) => {
+                fn conflict<F: FnOnce(DiagInfo) -> AsmErrorKind>(
+                    other_def: &(Location<'_>, Location<'_>),
+                    err_constructor: F,
+                ) -> Result<usize, AsmErrorKind> {
+                    let other_def_info = Fstack::make_diag_info(&other_def.0, Some(&other_def.1));
+                    Err(err_constructor(other_def_info))
+                }
 
-            let other_def_info =
-                Fstack::make_diag_info(&other.definition.0, Some(&other.definition.1));
-            return Err(AsmError {
-                begin: def_begin,
-                end: def_end,
-                kind: AsmErrorKind::SectAlreadyDefined(name_string, other_def_info),
-            });
-        }
+                let other = entry.get_mut();
+                match other.modifier {
+                    Modifier::Normal => conflict(&other.definition, |other_def_info| {
+                        AsmErrorKind::SectAlreadyDefined(name_string, other_def_info)
+                    }),
+                    _ if other.modifier != modifier => {
+                        conflict(&other.definition, |other_def_info| {
+                            AsmErrorKind::DifferentSectMod(
+                                name_string,
+                                other.modifier,
+                                other_def_info,
+                            )
+                        })
+                    }
+                    _ if other.kind != kind => conflict(&other.definition, |other_def_info| {
+                        AsmErrorKind::DifferentSectKind(name_string, other.kind, other_def_info)
+                    }),
+                    Modifier::Union => {
+                        if kind.has_data() {
+                            Err(AsmErrorKind::RomUnion(kind))
+                        } else {
+                            // Start anew at the beginning of the section.
+                            other.attrs.merge_union(name_string, &attrs).map(|()| 0)
+                        }
+                    }
+                    Modifier::Fragment => {
+                        // len_virt, or real len?
+                        other
+                            .attrs
+                            .concat_fragments(name_string, &attrs)
+                            .map(|()| todo!())
+                    }
+                }
+                .map_err(|kind| AsmError {
+                    begin: def_begin,
+                    end: def_end,
+                    kind,
+                })
+            }
 
-        let (attrs, def_begin, def_end) = NormalizedSectAttrs::try_new(
-            kind, address, attrs, def_begin, def_end, symbols, macro_args, self,
-        )?;
-        self.sections.insert(
-            name,
-            SectionData::new(kind, modifier, (def_begin, def_end), attrs),
-        );
+            Entry::Vacant(entry) => {
+                entry.insert(SectionData::new(
+                    kind,
+                    modifier,
+                    (def_begin, def_end),
+                    attrs,
+                ));
+
+                Ok(0) // Start at the section's beginning, obviously.
+            }
+        }?;
 
         // Make the section "active".
-        *self.stack.last_mut().unwrap() = Some(ActiveSection::new(name));
+        *self.stack.last_mut().unwrap() = Some(ActiveSection::new(name, offset));
 
         Ok(())
     }
@@ -100,10 +142,7 @@ pub struct SectionData<'fstack> {
     kind: Kind,
     modifier: Modifier,
     definition: (Location<'fstack>, Location<'fstack>),
-    address: Option<u16>,
-    bank: Option<u32>,
-    alignment: u8,
-    align_offset: u16,
+    attrs: NormalizedSectAttrs,
 
     patches: Vec<Relocation<'fstack>>,
     /// This vector is only used if `self.kind.has_data()`.
@@ -117,21 +156,13 @@ impl<'fstack> SectionData<'fstack> {
         kind: Kind,
         modifier: Modifier,
         definition: (Location<'fstack>, Location<'fstack>),
-        NormalizedSectAttrs {
-            address,
-            bank,
-            alignment,
-            align_offset,
-        }: NormalizedSectAttrs,
+        attrs: NormalizedSectAttrs,
     ) -> Self {
         Self {
             kind,
             modifier,
             definition,
-            address,
-            bank,
-            alignment,
-            align_offset,
+            attrs,
 
             patches: vec![],
             data: vec![],
@@ -165,11 +196,11 @@ struct ActiveSection {
 }
 
 impl ActiveSection {
-    fn new(name: SymbolU32) -> Self {
+    fn new(name: SymbolU32, offset: usize) -> Self {
         Self {
             name,
 
-            offset: 0,
+            offset,
             pc_section: None,
             pc_offset: 0,
             label_scope: None,
@@ -182,7 +213,7 @@ pub struct SectionHandle<'a, 'fstack>(&'a ActiveSection, &'a SectionData<'fstack
 
 impl<'fstack> SectionHandle<'_, 'fstack> {
     pub fn try_get_pc(&self) -> Option<u16> {
-        self.1.address.map(|base_addr| {
+        self.1.attrs.address.map(|base_addr| {
             base_addr.wrapping_add(self.1.data.len().try_into().unwrap_or(u16::MAX))
         })
     }
@@ -281,7 +312,7 @@ pub struct SectionAttributes<'fstack> {
 }
 
 #[derive(Debug)]
-struct NormalizedSectAttrs {
+pub struct NormalizedSectAttrs {
     address: Option<u16>,
     bank: Option<u32>,
     alignment: u8,
@@ -289,7 +320,7 @@ struct NormalizedSectAttrs {
 }
 
 impl NormalizedSectAttrs {
-    fn try_new<'fstack>(
+    pub fn try_new<'fstack>(
         kind: Kind,
         address: Option<Expression<'fstack>>,
         attrs: SectionAttributes<'fstack>,
@@ -299,7 +330,7 @@ impl NormalizedSectAttrs {
         macro_args: Option<&MacroArgs>,
         sections: &Sections,
     ) -> Result<(Self, Location<'fstack>, Location<'fstack>), AsmError<'fstack>> {
-        let banks = kind.banks(true);
+        let banks = kind.banks(true); // At assembly stage, we allow everything that may possibly be valid.
         let start_addr = kind.start_addr();
 
         // First, "lower" the raw expressions into something easier to manipulate.
@@ -403,8 +434,7 @@ impl NormalizedSectAttrs {
                         begin: def_begin,
                         end: def_end,
                         kind: AsmErrorKind::AlignMismatch(addr, alignment, align_offset),
-                    }
-                    .into());
+                    });
                 }
                 alignment = 0; // Ignore alignment if the address already satisfies it.
             } else if start_addr & mask != 0 {
@@ -412,8 +442,7 @@ impl NormalizedSectAttrs {
                     begin: def_begin,
                     end: def_end,
                     kind: AsmErrorKind::OverAligned(alignment, kind),
-                }
-                .into());
+                });
             } else if alignment == 16 {
                 alignment = 0;
                 address = Some(16);
@@ -439,5 +468,39 @@ impl NormalizedSectAttrs {
             def_begin,
             def_end,
         ))
+    }
+
+    // Common checks between `merge_union` and `concat_fragments`.
+    fn merge(&mut self, name: SourceString, other: &Self) -> Result<SourceString, AsmErrorKind> {
+        // For the bank, if either is unspecified then the other one wins; otherwise, both must agree.
+        match (self.bank, other.bank) {
+            (Some(current), Some(new)) => {
+                if current != new {
+                    return Err(AsmErrorKind::DifferentBank(name, current, new));
+                }
+            }
+            // No-op if both are `None`, but let's let the optimiser decide how to handle that case.
+            (None, other_bank) => self.bank = other_bank,
+            (Some(_), None) => {} // The current constraint is stronger.
+        }
+
+        Ok(name)
+    }
+
+    fn merge_union(&mut self, name: SourceString, other: &Self) -> Result<(), AsmErrorKind> {
+        let name = self.merge(name, other)?;
+
+        // Address-wise, any "compatible" constraints are acceptable, and we end up with the strictest.
+        todo!();
+
+        Ok(())
+    }
+
+    fn concat_fragments(&mut self, name: SourceString, other: &Self) -> Result<(), AsmErrorKind> {
+        let name = self.merge(name, other)?;
+
+        todo!();
+
+        Ok(())
     }
 }
